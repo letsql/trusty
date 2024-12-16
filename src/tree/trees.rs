@@ -11,12 +11,12 @@ use arrow::record_batch::RecordBatch;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-const CHUNK_SIZE: usize = 1024;
-const TREE_BATCH_SIZE: usize = 16;
+const CHUNK_SIZE: usize = 2 * 64;
 
 type VecTreeWithTreeNode = VecTree<TreeNode>;
 
@@ -331,7 +331,6 @@ impl FeatureTree {
         if feature_types.is_empty() {
             return Err(FeatureTreeError::MissingFeatureTypes);
         }
-
         if nodes.is_empty() {
             return Err(FeatureTreeError::InvalidStructure("Empty tree".to_string()));
         }
@@ -554,85 +553,81 @@ impl Default for GradientBoostedDecisionTrees {
 
 impl GradientBoostedDecisionTrees {
     pub fn predict_batches(&self, batches: &[RecordBatch]) -> Result<Float32Array, ArrowError> {
-        // Parallelize batch feature extraction and chunk creation
-        let chunks: Vec<(Vec<Vec<f32>>, std::ops::Range<usize>)> = batches
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let mut builder = Float32Builder::with_capacity(total_rows);
+
+        let results: Result<Vec<_>, ArrowError> = batches
             .par_iter()
-            .map(|batch| -> Result<Vec<_>, ArrowError> {
+            .try_fold(Vec::new, |mut acc, batch| {
                 let feature_values = self.extract_features(batch.columns())?;
-                let num_rows = feature_values[0].len();
-
-                // Create chunks for this batch
-                Ok((0..num_rows)
-                    .step_by(CHUNK_SIZE)
-                    .map(|start| {
-                        let end = (start + CHUNK_SIZE).min(num_rows);
-                        (feature_values.clone(), start..end)
-                    })
-                    .collect())
+                let predictions = self.predict_batch_internal(&feature_values)?;
+                acc.extend_from_slice(predictions.values());
+                Ok(acc)
             })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+            .try_reduce(Vec::new, |mut a, mut b| {
+                a.append(&mut b);
+                Ok(a)
+            });
 
-        self.predict_chunks(chunks)
+        builder.append_slice(&results?);
+        Ok(builder.finish())
     }
 
     #[inline]
     pub fn predict_arrays(&self, feature_arrays: &[ArrayRef]) -> Result<Float32Array, ArrowError> {
-        // Extract features once
         let feature_values = self.extract_features(feature_arrays)?;
-        let num_rows = feature_values[0].len();
-
-        // Create chunks similar to predict_batches
-        let chunks: Vec<(Vec<Vec<f32>>, std::ops::Range<usize>)> = (0..num_rows)
-            .step_by(CHUNK_SIZE)
-            .map(|start| {
-                let end = (start + CHUNK_SIZE).min(num_rows);
-                (feature_values.clone(), start..end)
-            })
-            .collect();
-
-        self.predict_chunks(chunks)
+        self.predict_batch_internal(&feature_values)
     }
 
-    // Common prediction logic for both methods
-    fn predict_chunks(
+    #[inline]
+    fn predict_batch_internal(
         &self,
-        chunks: Vec<(Vec<Vec<f32>>, std::ops::Range<usize>)>,
+        feature_values: &[Vec<f32>],
     ) -> Result<Float32Array, ArrowError> {
-        // Process chunks in parallel
-        let predictions: Vec<f32> = chunks
+        let num_rows = feature_values[0].len();
+        let num_features = feature_values.len();
+        let chunk_size = CHUNK_SIZE;
+
+        thread_local! {
+            static FEATURE_BUFFER: RefCell<Vec<f32>> = const {RefCell::new(Vec::new())};
+        }
+        let predictions: Vec<f32> = (0..num_rows)
             .into_par_iter()
-            .map(|(feature_values, range)| {
-                let chunk_size = range.end - range.start;
-                let mut feature_buffer = vec![0.0; feature_values.len()];
-                let mut scores = vec![self.base_score; chunk_size];
+            .chunks(chunk_size)
+            .fold(
+                || Vec::with_capacity(chunk_size), // Pre-allocate result vector
+                |mut chunk_results, chunk| {
+                    FEATURE_BUFFER.with(|buffer| {
+                        let mut buffer = buffer.borrow_mut();
+                        buffer.resize(num_features, 0.0);
 
-                for tree_batch in self.trees.chunks(TREE_BATCH_SIZE) {
-                    for (i, score) in scores.iter_mut().enumerate().take(chunk_size) {
-                        let row_idx = range.start + i;
+                        // Process chunk in larger blocks for better vectorization
+                        chunk_results.reserve(chunk.len());
+                        for row_idx in chunk {
+                            // Gather row features
+                            for (j, col) in feature_values.iter().enumerate() {
+                                buffer[j] = col[row_idx];
+                            }
 
-                        for (j, col) in feature_values.iter().enumerate() {
-                            feature_buffer[j] = col[row_idx];
+                            // Process trees
+                            let mut score = self.base_score;
+                            for tree in &self.trees {
+                                score += tree.predict(&buffer);
+                            }
+                            chunk_results.push(self.objective.compute_score(score));
                         }
+                        chunk_results
+                    })
+                },
+            )
+            .reduce(
+                || Vec::with_capacity(num_rows / rayon::current_num_threads()),
+                |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                },
+            );
 
-                        *score += tree_batch
-                            .iter()
-                            .map(|tree| tree.predict(&feature_buffer))
-                            .sum::<f32>();
-                    }
-                }
-
-                scores
-                    .into_iter()
-                    .map(|score| self.objective.compute_score(score))
-                    .collect::<Vec<_>>()
-            })
-            .flatten()
-            .collect();
-
-        // Create the final array
         let mut builder = Float32Builder::with_capacity(predictions.len());
         builder.append_slice(&predictions);
         Ok(builder.finish())
@@ -640,7 +635,6 @@ impl GradientBoostedDecisionTrees {
 
     #[inline]
     fn extract_features(&self, feature_arrays: &[ArrayRef]) -> Result<Vec<Vec<f32>>, ArrowError> {
-        // Existing extract_features implementation remains the same
         let num_rows = feature_arrays[0].len();
         let mut feature_values = Vec::with_capacity(feature_arrays.len());
 
@@ -654,40 +648,52 @@ impl GradientBoostedDecisionTrees {
                             ArrowError::InvalidArgumentError("Expected Float32Array".into())
                         })?;
 
-                    let mut values = Vec::with_capacity(num_rows);
-                    if let Some(null_bitmap) = array.nulls() {
-                        let values_slice = array.values();
-                        for i in 0..num_rows {
-                            values.push(if null_bitmap.is_null(i) {
-                                f32::NAN
-                            } else {
-                                values_slice[i]
-                            });
-                        }
+                    if array.nulls().is_none() {
+                        array.values().to_vec()
                     } else {
-                        values.extend_from_slice(array.values());
+                        // Efficient null handling with pre-allocation
+                        let mut values = Vec::with_capacity(num_rows);
+                        let values_slice = array.values();
+                        let null_bitmap = array.nulls().unwrap();
+
+                        // Process in chunks for better cache utilization
+                        for chunk in values_slice.chunks(CHUNK_SIZE) {
+                            let start = values.len();
+                            values.extend(chunk.iter().enumerate().map(|(i, &val)| {
+                                if null_bitmap.is_null(start + i) {
+                                    f32::NAN
+                                } else {
+                                    val
+                                }
+                            }));
+                        }
+                        values
                     }
-                    values
                 }
                 (DataType::Int64, FeatureType::Int) => {
                     let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                         ArrowError::InvalidArgumentError("Expected Int64Array".into())
                     })?;
 
-                    let mut values = Vec::with_capacity(num_rows);
-                    if let Some(null_bitmap) = array.nulls() {
-                        let values_slice = array.values();
-                        for i in 0..num_rows {
-                            values.push(if null_bitmap.is_null(i) {
-                                f32::NAN
-                            } else {
-                                values_slice[i] as f32
-                            });
-                        }
+                    if array.nulls().is_none() {
+                        array.values().iter().map(|&x| x as f32).collect()
                     } else {
-                        values.extend(array.values().iter().map(|&x| x as f32));
+                        let mut values = Vec::with_capacity(num_rows);
+                        let values_slice = array.values();
+                        let null_bitmap = array.nulls().unwrap();
+
+                        for chunk in values_slice.chunks(CHUNK_SIZE) {
+                            let start = values.len();
+                            values.extend(chunk.iter().enumerate().map(|(i, &val)| {
+                                if null_bitmap.is_null(start + i) {
+                                    f32::NAN
+                                } else {
+                                    val as f32
+                                }
+                            }));
+                        }
+                        values
                     }
-                    values
                 }
                 (DataType::Boolean, FeatureType::Indicator) => {
                     let array = array
@@ -697,8 +703,16 @@ impl GradientBoostedDecisionTrees {
                             ArrowError::InvalidArgumentError("Expected BooleanArray".into())
                         })?;
 
-                    let mut values = Vec::with_capacity(num_rows);
-                    if let Some(null_bitmap) = array.nulls() {
+                    if array.nulls().is_none() {
+                        array
+                            .values()
+                            .iter()
+                            .map(|x| if x { 1.0 } else { 0.0 })
+                            .collect()
+                    } else {
+                        let mut values = Vec::with_capacity(num_rows);
+                        let null_bitmap = array.nulls().unwrap();
+
                         for i in 0..num_rows {
                             values.push(if null_bitmap.is_null(i) {
                                 f32::NAN
@@ -708,17 +722,15 @@ impl GradientBoostedDecisionTrees {
                                 0.0
                             });
                         }
-                    } else {
-                        values.extend(array.values().iter().map(|x| if x { 1.0 } else { 0.0 }));
+                        values
                     }
-                    values
                 }
-                (actual, expected) => {
+                (actual_type, expected_type) => {
                     return Err(ArrowError::InvalidArgumentError(format!(
                         "Feature: expected {:?} for type {}, got {:?}",
-                        expected.get_arrow_data_type(),
-                        expected,
-                        actual
+                        expected_type.get_arrow_data_type(),
+                        expected_type,
+                        actual_type
                     )));
                 }
             };
