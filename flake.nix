@@ -103,7 +103,7 @@
           ln -s ${datasets.airline} $out/data/airline_satisfaction.csv
         '';
 
-        danEnv = pkgs.poetry2nix.mkPoetryApplication {
+        poetryApplication = pkgs.poetry2nix.mkPoetryApplication {
           projectDir = ./.;
           preferWheels = true;
           python = pkgs.python312;
@@ -140,42 +140,6 @@
             });
         };
 
-        poetryApplication = pkgs.poetry2nix.mkPoetryApplication {
-          projectDir = ./.;
-          preferWheels = true;
-          nativeBuildInputs = [ pkgs.maturin rustToolchain cargoDeps pkgs.pkg-config ];
-          # we need to add the following buildInputs to ensure that the build environment works with maturin
-          buildInputs = with pkgs; [
-            openssl
-            cacert
-          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.libiconv
-            pkgs.darwin.apple_sdk.frameworks.Security
-          ];
-
-          preBuild = ''
-            export CARGO_HOME="$PWD/.cargo"
-            export RUSTUP_HOME="$PWD/.rustup"
-            mkdir -p $CARGO_HOME
-            
-          '';
-          overrides = pkgs.poetry2nix.overrides.withDefaults
-            (self: super: {
-              atpublic = super.atpublic.overridePythonAttrs
-                (
-                  old: {
-                    buildInputs = (old.buildInputs or [ ]) ++ [ super.hatchling ];
-                  }
-                );
-              xgboost = super.xgboost.overridePythonAttrs (old: { } // pkgs.lib.attrsets.optionalAttrs pkgs.stdenv.isDarwin {
-                nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ super.cmake ];
-                cmakeDir = "../cpp_src";
-                preBuild = ''
-                  cd ..
-                '';
-              });
-            });
-        };
         buildMaturinScript = pkgs.writeScriptBin "build-maturin" ''
           #!${pkgs.stdenv.shell}
           echo "Building maturin wheel..."
@@ -254,18 +218,18 @@
       in
       {
         apps = rec {
-          danApp = {
+          poetryApp = {
             type = "app";
-            program = "${danEnv.dependencyEnv}/bin/ipython";
+            program = "${poetryApplication.dependencyEnv}/bin/ipython";
           };
-          default = danApp;
+          default = poetryApp;
         };
         packages = {
           trusty = trusty;
           pyApp = poetryApplication;
           data = dataFiles;
           datafusion-udf-example = datafusion-udf-wrapper;
-          inherit danEnv;
+          inherit poetryApplication;
           default = datafusion-udf-wrapper;
         };
 
@@ -334,7 +298,7 @@
         };
         devShells.danShell = pkgs.mkShell {
           buildInputs = [
-            danEnv
+            poetryApplication
             rustToolchain
           ];
         };
