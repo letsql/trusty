@@ -103,6 +103,43 @@
           ln -s ${datasets.airline} $out/data/airline_satisfaction.csv
         '';
 
+        danEnv = pkgs.poetry2nix.mkPoetryApplication {
+          projectDir = ./.;
+          preferWheels = true;
+          python = pkgs.python312;
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = customFilter;
+          };
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "gbdt-0.1.3" = "sha256-f2uqulFSNGwrDM7RPdGIW11VpJRYexektXjHxTJHHmA=";
+            };
+          };
+          nativeBuildInputs = [
+            pkgs.rustPlatform.cargoSetupHook
+            pkgs.rustPlatform.maturinBuildHook
+            rustToolchain
+            pkgs.pkg-config
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ];
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ];
+          overrides = pkgs.poetry2nix.overrides.withDefaults
+            (self: super: {
+              xgboost = super.xgboost.overridePythonAttrs (old: { } // pkgs.lib.attrsets.optionalAttrs pkgs.stdenv.isDarwin {
+                nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ super.cmake ];
+                cmakeDir = "../cpp_src";
+                preBuild = ''
+                  cd ..
+                '';
+              });
+            });
+        };
+
         poetryApplication = pkgs.poetry2nix.mkPoetryApplication {
           projectDir = ./.;
           preferWheels = true;
@@ -216,11 +253,19 @@
         };
       in
       {
+        apps = rec {
+          danApp = {
+            type = "app";
+            program = "${danEnv.dependencyEnv}/bin/ipython";
+          };
+          default = danApp;
+        };
         packages = {
           trusty = trusty;
           pyApp = poetryApplication;
           data = dataFiles;
           datafusion-udf-example = datafusion-udf-wrapper;
+          inherit danEnv;
           default = datafusion-udf-wrapper;
         };
 
@@ -286,6 +331,12 @@
             ${pre-commit-check.shellHook}
             echo "Run 'build-maturin' to rebuild and install the package"
           '';
+        };
+        devShells.danShell = pkgs.mkShell {
+          buildInputs = [
+            danEnv
+            rustToolchain
+          ];
         };
       });
 }
