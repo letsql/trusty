@@ -54,12 +54,11 @@ impl PyGradientBoostedDecisionTrees {
     fn predict_batches(&self, py_record_batches: &Bound<'_, PyList>) -> PyResult<Vec<f32>> {
         let mut batches = Vec::with_capacity(py_record_batches.len());
 
-        // Convert all record batches
         for py_batch in py_record_batches.iter() {
             let py_arrow_type = py_batch.extract::<PyArrowType<RecordBatch>>()?;
             let record_batch = py_arrow_type.0;
 
-            // Convert Float64 arrays to Float32
+            // convert Float64 arrays to Float32
             let arrays: Vec<ArrayRef> = record_batch
                 .columns()
                 .iter()
@@ -72,7 +71,6 @@ impl PyGradientBoostedDecisionTrees {
                 })
                 .collect();
 
-            // Create new schema with Float32 fields
             let new_schema = Schema::new(
                 record_batch
                     .schema()

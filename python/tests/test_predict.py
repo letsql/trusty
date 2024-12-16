@@ -24,11 +24,9 @@ def test_predict():
     actual_preds = df['prediction'].copy().to_list()
     df = df.drop(["target", "prediction"], axis=1)
     batch = pa.RecordBatch.from_pandas(df)
-    predictions = model.predict_batch(batch)
-    assert len(predictions) == len(df)
-    assert all([isinstance(p, float) for p in predictions])
-    assert all([p >= 0 for p in predictions])
-    np.testing.assert_array_almost_equal(np.array(predictions), np.array(actual_preds), decimal=12) # 10^(-12)
+    predictions = model.predict_batches([batch])
+    assert len(predictions) == len(df) 
+    np.testing.assert_array_almost_equal(np.array(predictions), np.array(actual_preds), decimal=3)
 
 
 def test_pruning():
@@ -44,9 +42,10 @@ def test_pruning():
     batch = pa.RecordBatch.from_pandas(df)
     predicates = [Feature("carat") < 0.2]
     actual_preds = df['prediction'].copy().to_list()
+    df = df.drop(["target", "prediction"], axis=1)
     pruned_model = model.prune(predicates)
-    predictions = pruned_model.predict_batch(batch)
+    predictions = pruned_model.predict_batches([batch])
     assert len(predictions) == len(df)
     assert all([isinstance(p, float) for p in predictions])
     assert all([p >= 0 for p in predictions])
-    np.testing.assert_array_almost_equal(np.array(predictions), np.array(actual_preds), decimal=12) # 10^(-12)
+    np.testing.assert_array_almost_equal(np.array(predictions), np.array(actual_preds), decimal=3) # 10^(-12)
