@@ -8,11 +8,15 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Float32Array, Float32Builder, 
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+
+const CHUNK_SIZE: usize = 1024;
+const TREE_BATCH_SIZE: usize = 16;
 
 type VecTreeWithTreeNode = VecTree<TreeNode>;
 
@@ -549,39 +553,98 @@ impl Default for GradientBoostedDecisionTrees {
 }
 
 impl GradientBoostedDecisionTrees {
-    pub fn predict_batch(&self, batch: &RecordBatch) -> Result<Float32Array, ArrowError> {
-        self.predict_arrays(batch.columns())
+    pub fn predict_batches(&self, batches: &[RecordBatch]) -> Result<Float32Array, ArrowError> {
+        // Parallelize batch feature extraction and chunk creation
+        let chunks: Vec<(Vec<Vec<f32>>, std::ops::Range<usize>)> = batches
+            .par_iter()
+            .map(|batch| -> Result<Vec<_>, ArrowError> {
+                let feature_values = self.extract_features(batch.columns())?;
+                let num_rows = feature_values[0].len();
+
+                // Create chunks for this batch
+                Ok((0..num_rows)
+                    .step_by(CHUNK_SIZE)
+                    .map(|start| {
+                        let end = (start + CHUNK_SIZE).min(num_rows);
+                        (feature_values.clone(), start..end)
+                    })
+                    .collect())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        self.predict_chunks(chunks)
     }
 
-    fn extract_row_block(
-        feature_values: &[Vec<f32>],
-        range: std::ops::Range<usize>,
-    ) -> Vec<Vec<f32>> {
-        let num_features = feature_values.len();
-        let block_size = range.end - range.start;
-        let mut block = Vec::with_capacity(block_size);
-
-        for row_idx in range {
-            let mut row_features = Vec::with_capacity(num_features);
-            for col in feature_values {
-                row_features.push(col[row_idx]);
-            }
-            block.push(row_features);
-        }
-        block
-    }
-    #[allow(clippy::assign_op_pattern)]
     #[inline]
     pub fn predict_arrays(&self, feature_arrays: &[ArrayRef]) -> Result<Float32Array, ArrowError> {
-        const ROW_BLOCK_SIZE: usize = 256;
-        let num_rows = feature_arrays[0].len();
-        let num_features = feature_arrays.len();
-        let mut builder = Float32Builder::with_capacity(num_rows);
-        let mut feature_values = Vec::with_capacity(num_features);
+        // Extract features once
+        let feature_values = self.extract_features(feature_arrays)?;
+        let num_rows = feature_values[0].len();
 
-        // Existing feature value extraction code...
+        // Create chunks similar to predict_batches
+        let chunks: Vec<(Vec<Vec<f32>>, std::ops::Range<usize>)> = (0..num_rows)
+            .step_by(CHUNK_SIZE)
+            .map(|start| {
+                let end = (start + CHUNK_SIZE).min(num_rows);
+                (feature_values.clone(), start..end)
+            })
+            .collect();
+
+        self.predict_chunks(chunks)
+    }
+
+    // Common prediction logic for both methods
+    fn predict_chunks(
+        &self,
+        chunks: Vec<(Vec<Vec<f32>>, std::ops::Range<usize>)>,
+    ) -> Result<Float32Array, ArrowError> {
+        // Process chunks in parallel
+        let predictions: Vec<f32> = chunks
+            .into_par_iter()
+            .map(|(feature_values, range)| {
+                let chunk_size = range.end - range.start;
+                let mut feature_buffer = vec![0.0; feature_values.len()];
+                let mut scores = vec![self.base_score; chunk_size];
+
+                for tree_batch in self.trees.chunks(TREE_BATCH_SIZE) {
+                    for (i, score) in scores.iter_mut().enumerate().take(chunk_size) {
+                        let row_idx = range.start + i;
+
+                        for (j, col) in feature_values.iter().enumerate() {
+                            feature_buffer[j] = col[row_idx];
+                        }
+
+                        *score += tree_batch
+                            .iter()
+                            .map(|tree| tree.predict(&feature_buffer))
+                            .sum::<f32>();
+                    }
+                }
+
+                scores
+                    .into_iter()
+                    .map(|score| self.objective.compute_score(score))
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect();
+
+        // Create the final array
+        let mut builder = Float32Builder::with_capacity(predictions.len());
+        builder.append_slice(&predictions);
+        Ok(builder.finish())
+    }
+
+    #[inline]
+    fn extract_features(&self, feature_arrays: &[ArrayRef]) -> Result<Vec<Vec<f32>>, ArrowError> {
+        // Existing extract_features implementation remains the same
+        let num_rows = feature_arrays[0].len();
+        let mut feature_values = Vec::with_capacity(feature_arrays.len());
+
         for (array, feature_type) in feature_arrays.iter().zip(self.feature_types.iter()) {
-            // ... keeping all the existing match arms ...
             let values = match (array.data_type(), feature_type) {
                 (DataType::Float32, FeatureType::Float) => {
                     let array = array
@@ -663,49 +726,7 @@ impl GradientBoostedDecisionTrees {
             feature_values.push(values);
         }
 
-        let num_trees = self.trees.len();
-        if num_trees > 50 {
-            const TREE_BATCH_SIZE: usize = 128;
-            let mut scores = vec![self.base_score; num_rows];
-
-            // Process trees in cache-friendly batches
-            for tree_batch in self.trees.chunks(TREE_BATCH_SIZE) {
-                // Process rows in blocks to improve cache locality
-                for start_row in (0..num_rows).step_by(ROW_BLOCK_SIZE) {
-                    let end_row = (start_row + ROW_BLOCK_SIZE).min(num_rows);
-
-                    // Extract block of rows once
-                    let row_block = Self::extract_row_block(&feature_values, start_row..end_row);
-                    for tree in tree_batch {
-                        for (row_idx, row_features) in row_block.iter().enumerate() {
-                            let index = start_row + row_idx;
-                            scores[index] = scores[index] + tree.predict(row_features);
-                        }
-                    }
-                }
-            }
-
-            // Apply objective function after all scores are accumulated
-            for score in scores {
-                builder.append_value(self.objective.compute_score(score));
-            }
-        } else {
-            let mut row_features = vec![0.0; num_features];
-            // Original approach for small number of trees
-            for row in 0..num_rows {
-                for (i, values) in feature_values.iter().enumerate() {
-                    row_features[i] = values[row];
-                }
-
-                let mut score = self.base_score;
-                for tree in &self.trees {
-                    score += tree.predict(&row_features);
-                }
-                builder.append_value(self.objective.compute_score(score));
-            }
-        }
-
-        Ok(builder.finish())
+        Ok(feature_values)
     }
 
     pub fn num_trees(&self) -> usize {
@@ -999,7 +1020,7 @@ mod tests {
         };
 
         let batch = create_sample_record_batch();
-        let predictions = gbdt.predict_batch(&batch).unwrap();
+        let predictions = gbdt.predict_batches(&[batch]).unwrap();
 
         assert_eq!(predictions.len(), 4);
 

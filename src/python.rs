@@ -51,46 +51,57 @@ impl PyGradientBoostedDecisionTrees {
         Ok(PyGradientBoostedDecisionTrees { model })
     }
 
-    fn predict_batch(&self, py: Python<'_>, py_record_batch: PyObject) -> PyResult<Vec<f32>> {
-        let py_arrow_type = py_record_batch.extract::<PyArrowType<RecordBatch>>(py)?;
-        let record_batch = py_arrow_type.0; // inner recordbatch, wtf?
-        let arrays: Vec<ArrayRef> = record_batch
-            .columns()
-            .iter()
-            .map(|col| {
-                if col.data_type() == &DataType::Float64 {
-                    cast(col, &DataType::Float32).unwrap()
-                } else {
-                    Arc::clone(col)
-                }
-            })
-            .collect();
+    fn predict_batches(&self, py_record_batches: &Bound<'_, PyList>) -> PyResult<Vec<f32>> {
+        let mut batches = Vec::with_capacity(py_record_batches.len());
 
-        let new_schema = Schema::new(
-            record_batch
-                .schema()
-                .fields()
+        // Convert all record batches
+        for py_batch in py_record_batches.iter() {
+            let py_arrow_type = py_batch.extract::<PyArrowType<RecordBatch>>()?;
+            let record_batch = py_arrow_type.0;
+
+            // Convert Float64 arrays to Float32
+            let arrays: Vec<ArrayRef> = record_batch
+                .columns()
                 .iter()
-                .map(|field| {
-                    if field.data_type() == &DataType::Float64 {
-                        Arc::new(Field::new(
-                            field.name(),
-                            DataType::Float32,
-                            field.is_nullable(),
-                        ))
+                .map(|col| {
+                    if col.data_type() == &DataType::Float64 {
+                        cast(col, &DataType::Float32).unwrap()
                     } else {
-                        field.clone()
+                        Arc::clone(col)
                     }
                 })
-                .collect::<Vec<Arc<Field>>>(),
-        );
+                .collect();
 
-        let float32_batch = RecordBatch::try_new(Arc::new(new_schema), arrays).unwrap();
+            // Create new schema with Float32 fields
+            let new_schema = Schema::new(
+                record_batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        if field.data_type() == &DataType::Float64 {
+                            Arc::new(Field::new(
+                                field.name(),
+                                DataType::Float32,
+                                field.is_nullable(),
+                            ))
+                        } else {
+                            field.clone()
+                        }
+                    })
+                    .collect::<Vec<Arc<Field>>>(),
+            );
 
+            let float32_batch = RecordBatch::try_new(Arc::new(new_schema), arrays).unwrap();
+            batches.push(float32_batch);
+        }
+
+        // Process all batches at once
         let result = self
             .model
-            .predict_batch(&float32_batch)
+            .predict_batches(&batches)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
         Ok(result.values().to_vec())
     }
 
@@ -98,16 +109,13 @@ impl PyGradientBoostedDecisionTrees {
         let mut predicate = Predicate::new();
         for pred in predicates.iter() {
             let (feature_name, is_gte, threshold): (String, bool, f64) = pred.extract()?;
-
             let condition = if is_gte {
                 Condition::GreaterThanOrEqual(threshold)
             } else {
                 Condition::LessThan(threshold)
             };
-
             predicate.add_condition(feature_name, condition);
         }
-
         Ok(Self {
             model: self.model.prune(&predicate),
         })

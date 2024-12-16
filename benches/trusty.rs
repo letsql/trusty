@@ -1,6 +1,6 @@
 #![allow(unused_must_use)]
 pub mod common;
-use arrow::array::{Array, ArrayRef, Float32Array};
+use arrow::array::{Array, Float32Array};
 use arrow::compute::concat;
 use arrow::record_batch::RecordBatch;
 use common::data_loader;
@@ -12,13 +12,12 @@ use serde_json::Value;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::Arc;
 use tokio::runtime::Runtime;
 use trusty::loader::ModelLoader;
 use trusty::predicates::{Condition, Predicate};
 use trusty::tree::GradientBoostedDecisionTrees;
 
-const BATCHSIZE: usize = 256;
+const BATCHSIZE: usize = 8192;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -26,28 +25,9 @@ fn predict_batch(
     trees: &GradientBoostedDecisionTrees,
     batches: &[RecordBatch],
 ) -> Result<Float32Array> {
-    let predictions: Vec<ArrayRef> = batches
-        .par_iter()
-        .map(|batch| -> Result<ArrayRef> {
-            Ok(Arc::new(
-                trees
-                    .predict_batch(batch)
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?,
-            ) as ArrayRef)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let arrays_ref: Vec<&dyn Array> = predictions.iter().map(|arr| arr.as_ref()).collect();
-    let concatenated =
-        concat(&arrays_ref).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-
-    concatenated
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            Box::<dyn Error + Send + Sync>::from("Failed to downcast concatenated array")
-        })
-        .cloned()
+    trees
+        .predict_batches(batches)
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
 }
 
 fn predict_batch_with_gbdt(model: &GBDT, batches: &[RecordBatch]) -> Result<Float32Array> {

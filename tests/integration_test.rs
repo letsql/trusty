@@ -1,5 +1,6 @@
 pub mod common;
 use arrow::array::Float32Array;
+use arrow::record_batch::RecordBatch;
 use common::{DatasetType, ModelTester, PredictionComparator};
 use std::error::Error;
 use trusty::{Condition, Predicate};
@@ -7,7 +8,6 @@ use trusty::{Condition, Predicate};
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_model_results() -> Result<(), Box<dyn Error>> {
         let epsilon = 1e-1;
@@ -24,37 +24,15 @@ mod tests {
         let expected_predictions = tester.extract_expected_predictions(&expected_results)?;
         let trusty_predictions: Vec<Float32Array> = preprocessed_batches
             .iter()
-            .map(|batch| trees.predict_batch(batch))
+            .map(|batch| trees.predict_batches(&[batch.clone()]))
             .collect::<Result<Vec<_>, _>>()?;
 
-        assert_eq!(
-            trusty_predictions.len(),
-            expected_predictions.len(),
-            "Number of prediction batches doesn't match: trusty={}, expected={}",
-            trusty_predictions.len(),
-            expected_predictions.len()
-        );
-
-        for (i, (trusty, expected)) in trusty_predictions
-            .iter()
-            .zip(expected_predictions.iter())
-            .enumerate()
-        {
-            assert_eq!(
-                trusty.len(),
-                expected.len(),
-                "Batch {} size mismatch: trusty={}, expected={}",
-                i,
-                trusty.len(),
-                expected.len()
-            );
-        }
-
-        PredictionComparator::new(epsilon).compare_predictions(
+        compare_prediction_results(
             &trusty_predictions,
             &expected_predictions,
             &preprocessed_batches,
             &expected_results,
+            epsilon,
         )
     }
 
@@ -76,41 +54,14 @@ mod tests {
         )?;
 
         let expected_predictions = tester.extract_expected_predictions(&expected_results)?;
+        let trusty_predictions = vec![pruned_trees.predict_batches(&preprocessed_batches)?];
 
-        let mut trusty_predictions = Vec::new();
-        println!("{:?}", expected_predictions[0]);
-
-        for batch in preprocessed_batches.iter() {
-            let prediction = pruned_trees.predict_batch(batch)?;
-            trusty_predictions.push(prediction);
-        }
-        assert_eq!(
-            trusty_predictions.len(),
-            expected_predictions.len(),
-            "Number of prediction batches doesn't match: trusty={}, expected={}",
-            trusty_predictions.len(),
-            expected_predictions.len()
-        );
-
-        for (i, (trusty, expected)) in trusty_predictions
-            .iter()
-            .zip(expected_predictions.iter())
-            .enumerate()
-        {
-            assert_eq!(
-                trusty.len(),
-                expected.len(),
-                "Batch {} size mismatch: trusty={}, expected={}",
-                i,
-                trusty.len(),
-                expected.len()
-            );
-        }
-        PredictionComparator::new(epsilon).compare_predictions(
+        compare_prediction_results(
             &trusty_predictions,
             &expected_predictions,
             &preprocessed_batches,
             &expected_results,
+            epsilon,
         )
     }
 
@@ -129,40 +80,17 @@ mod tests {
         )?;
 
         let expected_predictions = tester.extract_expected_predictions(&expected_results)?;
-        let mut trusty_predictions = Vec::new();
+        let trusty_predictions: Vec<Float32Array> = preprocessed_batches
+            .iter()
+            .map(|batch| trees.predict_batches(&[batch.clone()]))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        for (batch_idx, batch) in preprocessed_batches.iter().enumerate() {
-            let prediction = trees.predict_batch(batch)?;
-
-            if let Some(expected) = expected_predictions.get(batch_idx) {
-                assert_eq!(
-                    prediction.len(),
-                    expected.len(),
-                    "Batch {} size mismatch: trusty={}, expected={}",
-                    batch_idx,
-                    prediction.len(),
-                    expected.len()
-                );
-            } else {
-                return Err(format!("No expected prediction for batch {}", batch_idx).into());
-            }
-
-            trusty_predictions.push(prediction);
-        }
-
-        assert_eq!(
-            trusty_predictions.len(),
-            expected_predictions.len(),
-            "Number of prediction batches doesn't match: trusty={}, expected={}",
-            trusty_predictions.len(),
-            expected_predictions.len()
-        );
-
-        PredictionComparator::new(epsilon).compare_predictions(
+        compare_prediction_results(
             &trusty_predictions,
             &expected_predictions,
             &preprocessed_batches,
             &expected_results,
+            epsilon,
         )
     }
 
@@ -182,37 +110,15 @@ mod tests {
         let expected_predictions = tester.extract_expected_predictions(&expected_results)?;
         let trusty_predictions: Vec<Float32Array> = preprocessed_batches
             .iter()
-            .map(|batch| trees.predict_batch(batch))
+            .map(|batch| trees.predict_batches(&[batch.clone()]))
             .collect::<Result<Vec<_>, _>>()?;
 
-        assert_eq!(
-            trusty_predictions.len(),
-            expected_predictions.len(),
-            "Number of prediction batches doesn't match: trusty={}, expected={}",
-            trusty_predictions.len(),
-            expected_predictions.len()
-        );
-
-        for (i, (trusty, expected)) in trusty_predictions
-            .iter()
-            .zip(expected_predictions.iter())
-            .enumerate()
-        {
-            assert_eq!(
-                trusty.len(),
-                expected.len(),
-                "Batch {} size mismatch: trusty={}, expected={}",
-                i,
-                trusty.len(),
-                expected.len()
-            );
-        }
-
-        PredictionComparator::new(epsilon).compare_predictions(
+        compare_prediction_results(
             &trusty_predictions,
             &expected_predictions,
             &preprocessed_batches,
             &expected_results,
+            epsilon,
         )
     }
 
@@ -232,9 +138,25 @@ mod tests {
         let expected_predictions = tester.extract_expected_predictions(&expected_results)?;
         let trusty_predictions: Vec<Float32Array> = preprocessed_batches
             .iter()
-            .map(|batch| trees.predict_batch(batch))
+            .map(|batch| trees.predict_batches(&[batch.clone()]))
             .collect::<Result<Vec<_>, _>>()?;
 
+        compare_prediction_results(
+            &trusty_predictions,
+            &expected_predictions,
+            &preprocessed_batches,
+            &expected_results,
+            epsilon,
+        )
+    }
+
+    fn compare_prediction_results(
+        trusty_predictions: &[Float32Array],
+        expected_predictions: &[&Float32Array],
+        preprocessed_batches: &[RecordBatch],
+        expected_results: &[RecordBatch],
+        epsilon: f32,
+    ) -> Result<(), Box<dyn Error>> {
         assert_eq!(
             trusty_predictions.len(),
             expected_predictions.len(),
@@ -259,10 +181,10 @@ mod tests {
         }
 
         PredictionComparator::new(epsilon).compare_predictions(
-            &trusty_predictions,
-            &expected_predictions,
-            &preprocessed_batches,
-            &expected_results,
+            trusty_predictions,
+            expected_predictions,
+            preprocessed_batches,
+            expected_results,
         )
     }
 }

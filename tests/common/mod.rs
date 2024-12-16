@@ -140,7 +140,6 @@ impl PredictionComparator {
     pub fn new(epsilon: f32) -> Self {
         Self { epsilon }
     }
-
     pub fn compare_predictions(
         &self,
         trusty_predictions: &[Float32Array],
@@ -478,7 +477,7 @@ impl ModelTester {
             .iter()
             .map(|batch| {
                 trees
-                    .predict_batch(batch)
+                    .predict_batches(&[batch.clone()])
                     .map_err(|e| Box::new(e) as Box<dyn Error>)
             })
             .collect()
